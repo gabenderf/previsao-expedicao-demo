@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>parser.js — teste contra fixtures reais</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; max-width: 1100px; }
+  h1 { font-size: 18px; }
+  .ok   { color: #0a7d2e; }
+  .fail { color: #c1121f; font-weight: 600; }
+  .aviso { color: #9a6700; }
+  ul { padding-left: 18px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 12px; }
+  th, td { border: 1px solid #ddd; padding: 4px 6px; text-align: left; vertical-align: top; }
+  th { background: #f4f4f4; }
+  pre { background: #f7f7f7; padding: 10px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>parser.js — teste contra fixtures reais do UpSeller</h1>
+<div id="saida">carregando…</div>
+
+<script src="./parser.js"></script>
+<script src="./prazo.js"></script>
+<script src="./previsao.js"></script>
+<script>
+// Fixtures disponíveis. "Para Emitir" foi deixada de fora por decisão do
+// dono do projeto (17/08/2026): raramente há problema de emissão de NF.
+// O mesmo parser tem que dar conta das duas telas sem ramificação.
+const FIXTURES = [
+  {
+    arquivo: '../Para Enviar Pedidos - UpSeller.html',
+    etapa: 'para_enviar',
+    // Horário em que a página foi salva. "Expira em" é relativo a este
+    // instante — sem ele o prazo absoluto sai errado.
+    raspadoEm: new Date(2026, 7, 17, 9, 18, 0),
+    esperado: {
+      capturado: 27,      // linhas presentes no DOM salvo
+      total: 27,          // "Total" do rodapé
+      paginas: 1,
+      // Nesta etapa o rastreio AINDA NÃO EXISTE (nasce no processamento).
+      // null aqui é resultado correto, não falha.
+      temRastreio: false
+    }
+  },
+  {
+    arquivo: '../Para Imprimir Pedidos - UpSeller.html',
+    etapa: 'para_imprimir',
+    raspadoEm: new Date(2026, 7, 17, 10, 2, 0),
+    esperado: {
+      // ⚠️ 21 de 567: esta fixture flagra o VIRTUAL SCROLLING. Ler o DOM
+      // uma vez captura só as linhas visíveis. É o caminho que o coletor
+      // tem que marcar como "incompleto" em vez de gravar como sucesso.
+      capturado: 21,
+      total: 567,
+      paginas: 2,         // 567 com 300/página
+      temRastreio: true
+    }
+  }
+];
+
+const resultados = [];
+function checar(nome, condicao, detalhe) {
+  resultados.push({ nome, ok: !!condicao, detalhe: detalhe || '' });
+}
+
+// ------------------------------------------------------------------
+// Regra de prazo de fallback (prazo.js) — não precisa de fixture.
+// Tabela confirmada empiricamente sobre 15.000 pedidos (CLAUDE.md 3.6).
+// 17/08/2026 é uma SEGUNDA, então a semana de referência é 16→22/08.
+// ------------------------------------------------------------------
+function testarRegraDePrazo() {
+  const casos = [
+    // [descrição, pagamento, prazo esperado]
+    ['domingo manhã → terça',        new Date(2026,7,16, 9,0), '18/08/2026'],
+    ['domingo noite → terça',        new Date(2026,7,16,22,0), '18/08/2026'],
+    ['segunda antes das 13h → terça', new Date(2026,7,17, 9,0), '18/08/2026'],
+    ['segunda após 13h → terça',      new Date(2026,7,17,15,0), '18/08/2026'],
+    ['terça antes das 13h → mesmo dia', new Date(2026,7,18,10,0), '18/08/2026'],
+    ['terça após 13h → quarta',       new Date(2026,7,18,14,0), '19/08/2026'],
+    ['quinta após 13h → sexta',       new Date(2026,7,20,17,0), '21/08/2026'],
+    ['sexta antes das 13h → mesmo dia', new Date(2026,7,21,12,0), '21/08/2026'],
+    ['sexta após 13h → segunda',      new Date(2026,7,21,14,0), '24/08/2026'],
+    ['sábado → segunda',              new Date(2026,7,22,11,0), '24/08/2026']
+  ];
+
+  casos.forEach(([nome, pago, esperado]) => {
+    const d = FilaPrazo.prazoPelaRegra(pago);
+    checar(`[regra] ${nome}`, d && d.toLocaleDateString('pt-BR') === esperado,
+           d ? d.toLocaleDateString('pt-BR') : 'null');
+  });
+
+  // Todo prazo derivado tem que cair às 23:59:59, igual aos do UpSeller.
+  const h = FilaPrazo.prazoPelaRegra(new Date(2026,7,17,9,0));
+  checar('[regra] prazo derivado às 23:59:59',
+         h.getHours() === 23 && h.getMinutes() === 59 && h.getSeconds() === 59);
+
+  // Sem pagamento não há como derivar — e inventar seria pior.
+  checar('[regra] sem pago_em devolve null', FilaPrazo.prazoPelaRegra(null) === null);
+
+  // ⚠️ O ponto mais importante: prazo derivado NUNCA pode se passar por
+  // prazo do marketplace. A origem tem que ficar registrada.
+  const pedidos = [
+    { pago_em: new Date(2026,7,17,9,0).toISOString(), expira_em: '2026-08-18T23:59:59.000Z' },
+    { pago_em: new Date(2026,7,17,9,0).toISOString(), expira_em: null },
+    { pago_em: null, expira_em: null }
+  ];
+  FilaPrazo.aplicarFallback(pedidos);
+  checar('[regra] prazo vindo do UpSeller marcado como "upseller"', pedidos[0].prazo_origem === 'upseller');
+  checar('[regra] prazo derivado marcado como "regra"', pedidos[1].prazo_origem === 'regra');
+  checar('[regra] prazo derivado preenchido', !!pedidos[1].expira_em);
+  checar('[regra] sem prazo e sem pagamento fica sem origem', pedidos[2].prazo_origem === null);
+  checar('[regra] sem prazo e sem pagamento não inventa data', pedidos[2].expira_em === null);
+}
+
+// ------------------------------------------------------------------
+// Motor de previsão (previsao.js)
+// ------------------------------------------------------------------
+const CONFIG_TESTE = {
+  inicio_turno: '07:40',
+  inicio_producao: '08:30',
+  fim_turno: '17:40',
+  almoco_inicio: '13:00',
+  almoco_fim: '14:00',
+  ritmo_inclui_pausas: true,
+  fator_pessimista: 0.75,
+  fatores_dia_semana: { '1': 1.000, '2': 1.175, '3': 1.431, '4': 1.371, '5': 1.360 },
+  curva_chegada: { '8': 0.13, '9': 0.19, '10': 0.22, '11': 0.21, '12': 0.20 },
+  piso_ritmo_necessario: null
+};
+
+function pedidosFicticios(n, prazo) {
+  return Array.from({ length: n }, () => ({ expira_em: prazo, itens: [{ sku: 'X', quantidade: 1 }] }));
+}
+
+function hhmm(d) {
+  return d ? d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : 'não termina';
+}
+
+function testarPrevisao() {
+  // 17/08/2026 é SEGUNDA. Fator 1,000 e desvio zero: às 7h40 a carga já
+  // está toda visível, então não há chegada a projetar.
+  const segunda = new Date(2026, 7, 17, 7, 40);
+  const hoje2359 = new Date(2026, 7, 17, 23, 59, 59).toISOString();
+  const amanha2359 = new Date(2026, 7, 18, 23, 59, 59).toISOString();
+
+  checar('[previsão] segunda tem fator 1,000 (nada a projetar)',
+         FilaPrevisao.projetarVolumeDoDia(900, 1, CONFIG_TESTE) === 900);
+  checar('[previsão] terça aplica fator 1,175',
+         FilaPrevisao.projetarVolumeDoDia(1000, 2, CONFIG_TESTE) === 1175);
+  checar('[previsão] sábado não tem fator (nada a projetar)',
+         FilaPrevisao.projetarVolumeDoDia(100, 6, CONFIG_TESTE) === null);
+
+  // --- Dia leve: 150 pedidos, 3 pessoas a 35/h = 105/h ---
+  const leve = FilaPrevisao.prever({
+    pendentes: pedidosFicticios(150, hoje2359),
+    agora: segunda,
+    equipe: { pessoas: 3, ritmo_ped_h: 35 },
+    config: CONFIG_TESTE,
+    vistos_primeira_rodada: 150,
+    vistos_hoje: 150
+  });
+  checar('[previsão] dia leve termina dentro do turno', !!leve.termino_hoje_p50, hhmm(leve.termino_hoje_p50));
+  checar('[previsão] dia leve não acusa falta de capacidade', leve.falta_capacidade === false);
+  checar('[previsão] dia leve reporta horas-pessoa ociosas', leve.horas_pessoa_ociosas > 0,
+         leve.horas_pessoa_ociosas + 'h');
+  checar('[previsão] p90 termina depois do p50',
+         leve.termino_hoje_p90 >= leve.termino_hoje_p50, `${hhmm(leve.termino_hoje_p50)} → ${hhmm(leve.termino_hoje_p90)}`);
+  // Revisado em 18/08/2026: a meta passou a usar o ritmo NORMAL. A ponta
+  // pessimista saiu da tela e o piso do ritmo necessário virou 35/h —
+  // publicar meta calculada a 26/h enquanto se cobra 35/h era incoerente.
+  // O viés conservador ficou concentrado na equipe fixa de 3 pessoas.
+  checar('[previsão] meta usa o ritmo normal, igual ao que a tela mostra',
+         leve.termino_para_meta === leve.termino_hoje_p50);
+  checar('[previsão] a ponta pessimista continua calculada (só não é exibida)',
+         !!leve.termino_hoje_p90 && leve.termino_hoje_p90 >= leve.termino_hoje_p50);
+
+  // --- Terça pesada: 1.348 pedidos com 3 pessoas NÃO fecha (CLAUDE.md 4.5) ---
+  const terca = new Date(2026, 7, 18, 7, 40);
+  const pesado = FilaPrevisao.prever({
+    pendentes: pedidosFicticios(1148, new Date(2026, 7, 18, 23, 59, 59).toISOString()),
+    agora: terca,
+    equipe: { pessoas: 3, ritmo_ped_h: 35 },
+    config: CONFIG_TESTE,
+    vistos_primeira_rodada: 1148,
+    vistos_hoje: 1148
+  });
+  checar('[previsão] terça com 3 pessoas não fecha o turno', pesado.falta_capacidade === true,
+         `sobram ${pesado.sobra_obrigatoria_no_fim}`);
+  checar('[previsão] terça projeta volume acima do visível',
+         pesado.volume_previsto_dia > 1148, String(pesado.volume_previsto_dia));
+  checar('[previsão] terça não reporta ociosidade', pesado.horas_pessoa_ociosas === 0);
+
+  // --- Segmentação por prazo ---
+  const misto = FilaPrevisao.prever({
+    pendentes: [
+      ...pedidosFicticios(10, hoje2359),
+      ...pedidosFicticios(20, amanha2359),
+      { expira_em: null, itens: [] }
+    ],
+    agora: segunda,
+    equipe: { pessoas: 3, ritmo_ped_h: 35 },
+    config: CONFIG_TESTE
+  });
+  checar('[previsão] balde "hoje"', misto.baldes.hoje === 10, String(misto.baldes.hoje));
+  checar('[previsão] balde "amanhã"', misto.baldes.amanha === 20, String(misto.baldes.amanha));
+  checar('[previsão] balde "sem prazo" fica visível', misto.baldes.sem_prazo === 1);
+
+  // --- ⚠️ A dupla contagem do almoço ---
+  // Com ritmo_inclui_pausas=false a simulação para 1h, e o término tem que
+  // sair MAIS TARDE. É a diferença que o CLAUDE.md tinha nas duas versões:
+  // aplicar as duas coisas ao mesmo tempo desconta o almoço duas vezes.
+  const comParada = FilaPrevisao.prever({
+    pendentes: pedidosFicticios(700, hoje2359),
+    agora: segunda,
+    equipe: { pessoas: 3, ritmo_ped_h: 35 },
+    config: Object.assign({}, CONFIG_TESTE, { ritmo_inclui_pausas: false })
+  });
+  const semParada = FilaPrevisao.prever({
+    pendentes: pedidosFicticios(700, hoje2359),
+    agora: segunda,
+    equipe: { pessoas: 3, ritmo_ped_h: 35 },
+    config: CONFIG_TESTE
+  });
+  checar('[previsão] parada de almoço atrasa o término (dupla contagem se somada ao ped_h_real)',
+         comParada.termino_hoje_p50 > semParada.termino_hoje_p50,
+         `sem parada ${hhmm(semParada.termino_hoje_p50)} × com parada ${hhmm(comParada.termino_hoje_p50)}`);
+
+  // --- Início da produção às 8h30, não às 7h40 ---
+  // A raspagem roda às 7h40, mas ninguém está separando ainda. Simular a
+  // partir do turno dava ~50 min de produção inexistente.
+  const cedo = FilaPrevisao.prever({
+    pendentes: pedidosFicticios(105, hoje2359),      // exatamente 1h de trabalho a 105/h
+    agora: segunda,                                   // 7h40
+    equipe: { pessoas: 3, ritmo_ped_h: 35 },
+    config: CONFIG_TESTE
+  });
+  checar('[previsão] produção começa às 8h30, não às 7h40',
+         cedo.inicio_producao.getHours() === 8 && cedo.inicio_producao.getMinutes() === 30,
+         hhmm(cedo.inicio_producao));
+  checar('[previsão] 1h de trabalho a partir das 8h30 termina ~9h30',
+         hhmm(cedo.termino_hoje_p50) === '09:30', hhmm(cedo.termino_hoje_p50));
+
+  const comInicioAntigo = FilaPrevisao.prever({
+    pendentes: pedidosFicticios(105, hoje2359),
+    agora: segunda,
+    equipe: { pessoas: 3, ritmo_ped_h: 35 },
+    config: Object.assign({}, CONFIG_TESTE, { inicio_producao: '07:40' })
+  });
+  checar('[previsão] começar às 7h40 daria término 50 min mais cedo (o otimismo corrigido)',
+         cedo.termino_hoje_p50 - comInicioAntigo.termino_hoje_p50 === 50 * 60000,
+         `${hhmm(comInicioAntigo.termino_hoje_p50)} → ${hhmm(cedo.termino_hoje_p50)}`);
+
+  // --- Sobrescrever a equipe em dia de volume alto ---
+  const terca5 = FilaPrevisao.prever({
+    pendentes: pedidosFicticios(1148, new Date(2026, 7, 18, 23, 59, 59).toISOString()),
+    agora: terca,
+    equipe: { pessoas: 5, ritmo_ped_h: 35 },          // escala reforçada
+    config: CONFIG_TESTE,
+    vistos_primeira_rodada: 1148,
+    vistos_hoje: 1148
+  });
+  checar('[previsão] terça com 5 pessoas fecha o turno (3 não fechavam)',
+         terca5.falta_capacidade === false, hhmm(terca5.termino_hoje_p50));
+  checar('[previsão] equipe usada fica registrada para auditar depois',
+         terca5.equipe_usada.pessoas === 5);
+
+  // --- ⚠️ Fila grande de ADIANTAMENTO não é falta de capacidade ---
+  // Caso real de 17/08/2026 às 16h: 387 pendentes, dos quais só 6 venciam
+  // no dia. Avaliando a fila inteira, o painel ficava vermelho ("não fecha,
+  // sobram 215") com a operação tranquila. O que cobra é o balde de hoje.
+  const tarde = new Date(2026, 7, 17, 16, 3);
+  const adiantando = FilaPrevisao.prever({
+    pendentes: [
+      ...pedidosFicticios(6, hoje2359),
+      ...pedidosFicticios(373, amanha2359)
+    ],
+    agora: tarde,
+    equipe: { pessoas: 3, ritmo_ped_h: 35 },
+    config: CONFIG_TESTE
+  });
+  checar('[previsão] adiantamento de amanhã NÃO conta como falta de capacidade',
+         adiantando.falta_capacidade === false, hhmm(adiantando.termino_hoje_p50));
+  checar('[previsão] obrigatórios = atrasados + vencem hoje',
+         adiantando.obrigatorios === 6, String(adiantando.obrigatorios));
+  checar('[previsão] ritmo necessário reflete só o obrigatório',
+         adiantando.ritmo_necessario < 5, adiantando.ritmo_necessario + '/h');
+  checar('[previsão] ritmo para zerar tudo é reportado à parte',
+         adiantando.ritmo_para_zerar_tudo > 50, adiantando.ritmo_para_zerar_tudo + '/h');
+  checar('[previsão] término de "tudo" continua disponível e é mais tarde',
+         adiantando.termino_tudo_p50 === null || adiantando.termino_tudo_p50 > adiantando.termino_hoje_p50);
+
+  // Atrasado conta como obrigatório — é o caso mais urgente que existe.
+  const comAtraso = FilaPrevisao.prever({
+    pendentes: [
+      ...pedidosFicticios(10, new Date(2026, 7, 16, 23, 59, 59).toISOString()),  // venceu ontem
+      ...pedidosFicticios(5, hoje2359)
+    ],
+    agora: tarde,
+    equipe: { pessoas: 3, ritmo_ped_h: 35 },
+    config: CONFIG_TESTE
+  });
+  checar('[previsão] pedidos já vencidos entram no obrigatório',
+         comAtraso.obrigatorios === 15 && comAtraso.baldes.atrasado === 10,
+         `atrasados ${comAtraso.baldes.atrasado}`);
+
+  // --- Ritmo necessário ---
+  checar('[previsão] ritmo necessário é por pessoa, não da equipe',
+         leve.ritmo_necessario < 35, leve.ritmo_necessario + '/h');
+  const comPiso = FilaPrevisao.prever({
+    pendentes: pedidosFicticios(50, hoje2359),
+    agora: segunda,
+    equipe: { pessoas: 3, ritmo_ped_h: 35 },
+    config: Object.assign({}, CONFIG_TESTE, { piso_ritmo_necessario: 35 })
+  });
+  checar('[previsão] piso do ritmo necessário é respeitado quando configurado',
+         comPiso.ritmo_necessario === 35, comPiso.ritmo_necessario + '/h');
+}
+
+// ------------------------------------------------------------------
+// Alvo de linhas por página (parser.esperadoNaPagina) — não precisa de
+// fixture: é aritmética da paginação.
+//
+// ⚠️ É o critério de parada que faltava na rolagem do coletor. Sem ele, a
+// parada antecipada só podia comparar o acumulado de TODAS as páginas
+// contra o `Total` do rodapé — verdade apenas na última página. Em
+// 25/08/2026 a página 1 encerrou na linha ~212 de 300 e as posições
+// 213–300 nunca foram lidas: o snapshot saiu 353 de 446, disparou a
+// escalada, e cada rodada passou a custar ~10 min em vez de ~1.
+// ------------------------------------------------------------------
+function testarAlvoDePagina() {
+  const alvo = (o) => FilaParser.esperadoNaPagina(o);
+
+  // Cenário real de 25/08/2026: Total 446, 300/página, 2 páginas.
+  checar('[paginação] página cheia espera o tamanho da página',
+         alvo({ total_esperado: 446, por_pagina: 300, pagina_atual: 1, total_paginas: 2 }) === 300);
+  checar('[paginação] última página espera só o resto',
+         alvo({ total_esperado: 446, por_pagina: 300, pagina_atual: 2, total_paginas: 2 }) === 146,
+         '446 − 300 = 146');
+
+  // Cenário real de 24/08/2026: Total 1158 em 4 páginas.
+  checar('[paginação] última de 4 páginas espera 258',
+         alvo({ total_esperado: 1158, por_pagina: 300, pagina_atual: 4, total_paginas: 4 }) === 258);
+  checar('[paginação] página do meio espera cheia',
+         alvo({ total_esperado: 1158, por_pagina: 300, pagina_atual: 3, total_paginas: 4 }) === 300);
+
+  // Fila pequena: uma página só, e o alvo é o próprio Total.
+  checar('[paginação] fila de uma página espera o Total',
+         alvo({ total_esperado: 16, por_pagina: 300, pagina_atual: 1, total_paginas: 1 }) === 16);
+
+  // ⚠️ Degradar é obrigatório; quebrar não é opção. O UpSeller pode mudar o
+  // rodapé em qualquer deploy — sem tamanho de página a rolagem volta ao
+  // comportamento antigo em vez de encerrar a página na primeira linha.
+  checar('[paginação] sem tamanho de página devolve null (degrada, não quebra)',
+         alvo({ total_esperado: 446, pagina_atual: 1, total_paginas: 2 }) === null);
+  checar('[paginação] sem paginação nenhuma devolve null',
+         alvo(null) === null);
+  checar('[paginação] fila vazia não vira alvo 0',
+         alvo({ total_esperado: 0, por_pagina: 300, pagina_atual: 1, total_paginas: 1 }) === null);
+}
+
+(async function () {
+  const partes = [];
+  testarRegraDePrazo();
+  testarPrevisao();
+  testarAlvoDePagina();
+
+  for (const fx of FIXTURES) {
+    let html;
+    try {
+      html = await (await fetch(fx.arquivo)).text();
+    } catch (e) {
+      checar(`fixture ${fx.etapa} carregada`, false, String(e));
+      continue;
+    }
+
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const r = FilaParser.lerPagina(doc, { etapa: fx.etapa, raspadoEm: fx.raspadoEm });
+
+    checar(`[${fx.etapa}] tabela encontrada`, !r.erro, r.erro || '');
+    checar(`[${fx.etapa}] Total lido da paginação = ${fx.esperado.total}`,
+           r.paginacao.total_esperado === fx.esperado.total,
+           `leu ${r.paginacao.total_esperado}`);
+    checar(`[${fx.etapa}] pedidos extraídos = ${fx.esperado.capturado}`,
+           r.pedidos.length === fx.esperado.capturado,
+           `extraiu ${r.pedidos.length}`);
+    checar(`[${fx.etapa}] total de páginas = ${fx.esperado.paginas}`,
+           r.paginacao.total_paginas === fx.esperado.paginas,
+           `leu ${r.paginacao.pagina_atual}/${r.paginacao.total_paginas}`);
+
+    // Tamanho da página, lido do seletor "300/página" no rodapé.
+    checar(`[${fx.etapa}] tamanho da página lido do seletor`,
+           r.paginacao.por_pagina === 300, `leu ${r.paginacao.por_pagina}`);
+
+    // ⚠️ O indicador de página ("1/2") vive na MESMA caixa que o seletor
+    // ("300/página"), e os dois casam com /\d+\s*\/\s*\d+/. Um regex frouxo
+    // leria 1 como tamanho de página e a rolagem encerraria cada página na
+    // primeira linha — capturando 1 de 300 sem nada na tela indicando erro.
+    checar(`[${fx.etapa}] seletor de página não se confunde com o indicador`,
+           r.paginacao.por_pagina !== r.paginacao.pagina_atual &&
+           r.paginacao.por_pagina !== r.paginacao.total_paginas,
+           `por_pagina ${r.paginacao.por_pagina} × indicador ` +
+           `${r.paginacao.pagina_atual}/${r.paginacao.total_paginas}`);
+
+    // Quantas linhas esperar NESTA página: cheia se houver página depois,
+    // só o resto se for a última.
+    const alvoDaPagina = FilaParser.esperadoNaPagina(r.paginacao);
+    const alvoEsperado = fx.esperado.paginas > 1 ? 300 : fx.esperado.total;
+    checar(`[${fx.etapa}] alvo da página 1 = ${alvoEsperado}`,
+           alvoDaPagina === alvoEsperado, `calculou ${alvoDaPagina}`);
+
+    // A raspagem incompleta tem que ser DETECTÁVEL: um snapshot truncado em
+    // silêncio é indistinguível de fila pequena (CLAUDE.md Parte 1.4).
+    const completo = r.pedidos.length === r.paginacao.total_esperado;
+    checar(`[${fx.etapa}] incompletude detectável (capturado ${r.pedidos.length} × total ${r.paginacao.total_esperado})`,
+           completo === (fx.esperado.capturado === fx.esperado.total),
+           completo ? 'reportou completo' : 'reportou incompleto');
+
+    // Rastreio: presente em Para Imprimir, ausente antes do processamento.
+    const comRastreio = r.pedidos.filter(p => p.codigo_rastreio);
+    if (fx.esperado.temRastreio) {
+      checar(`[${fx.etapa}] todo pedido tem código de rastreio`,
+             comRastreio.length === r.pedidos.length,
+             `${comRastreio.length} de ${r.pedidos.length}`);
+      const formatoRuim = comRastreio.filter(p => !/^[A-Z0-9]{10,}$/.test(p.codigo_rastreio));
+      checar(`[${fx.etapa}] rastreios no formato esperado`, formatoRuim.length === 0,
+             formatoRuim.map(p => p.codigo_rastreio).join(', '));
+      const rastreiosUnicos = new Set(comRastreio.map(p => p.codigo_rastreio)).size;
+      checar(`[${fx.etapa}] rastreios únicos (não é o mesmo elemento lido N vezes)`,
+             rastreiosUnicos === comRastreio.length,
+             `${rastreiosUnicos} únicos de ${comRastreio.length}`);
+    } else {
+      checar(`[${fx.etapa}] nenhum rastreio (ainda não existe nesta etapa)`,
+             comRastreio.length === 0,
+             comRastreio.map(p => p.codigo_rastreio).join(', '));
+    }
+
+    const semNum = r.pedidos.filter(p => !/^UP[A-Z0-9]+$/.test(p.num_pedido || ''));
+    checar(`[${fx.etapa}] todo pedido tem nº UpSeller válido`, semNum.length === 0,
+           semNum.map(p => p.num_pedido).join(', '));
+
+    const semItens = r.pedidos.filter(p => !p.itens || p.itens.length === 0);
+    checar(`[${fx.etapa}] todo pedido tem ao menos 1 SKU`, semItens.length === 0,
+           semItens.map(p => p.num_pedido).join(', '));
+
+    const qtdInvalida = r.pedidos.filter(p => p.itens.some(i => !(i.quantidade > 0)));
+    checar(`[${fx.etapa}] toda quantidade > 0`, qtdInvalida.length === 0,
+           qtdInvalida.map(p => p.num_pedido).join(', '));
+
+    const semPago = r.pedidos.filter(p => !p.pago_em);
+    checar(`[${fx.etapa}] todo pedido tem hora de pagamento`, semPago.length === 0,
+           semPago.map(p => p.num_pedido).join(', '));
+
+    const semPrazo = r.pedidos.filter(p => !p.expira_em);
+    checar(`[${fx.etapa}] todo pedido tem prazo absoluto`, semPrazo.length === 0,
+           semPrazo.map(p => p.num_pedido).join(', '));
+
+    const semPlataforma = r.pedidos.filter(p => !p.num_pedido_plataforma);
+    checar(`[${fx.etapa}] todo pedido tem nº da plataforma`, semPlataforma.length === 0,
+           semPlataforma.map(p => p.num_pedido).join(', '));
+
+    const semLoja = r.pedidos.filter(p => !p.loja);
+    checar(`[${fx.etapa}] toda linha tem loja`, semLoja.length === 0,
+           semLoja.map(p => p.num_pedido).join(', '));
+
+    const duplicados = r.pedidos.length - new Set(r.pedidos.map(p => p.num_pedido)).size;
+    checar(`[${fx.etapa}] sem nº de pedido duplicado`, duplicados === 0, `${duplicados} duplicados`);
+
+    // O prazo tem que cair no futuro em relação à raspagem, e num horizonte plausível.
+    const prazoEstranho = r.pedidos.filter(p => {
+      const d = new Date(p.expira_em) - fx.raspadoEm;
+      return !(d > 0 && d < 15 * 86400000);
+    });
+    checar(`[${fx.etapa}] prazos caem entre agora e +15d`, prazoEstranho.length === 0,
+           prazoEstranho.map(p => `${p.num_pedido}:${p.expira_em_texto}`).join(', '));
+
+    // Todo prazo da Shopee é 23:59:59 de algum dia (ver CLAUDE.md 3.6).
+    const foraDaMeiaNoite = r.pedidos.filter(p => {
+      const d = new Date(p.expira_em);
+      return d.getHours() !== 23 || d.getMinutes() !== 59;
+    });
+    checar(`[${fx.etapa}] todo prazo normalizado para 23:59`, foraDaMeiaNoite.length === 0,
+           foraDaMeiaNoite.map(p => p.expira_em).join(', '));
+
+    // ⚠️ O teste que mais importa: um erro de ±5 min no horário da raspagem
+    // NÃO pode mudar o DIA do vencimento. Sem normalização, 2 minutos já
+    // empurravam 18/08 23:59 para 19/08 00:01 — de terça para quarta.
+    const variantes = [-5, -2, +2, +5].map(min => {
+      const t = new Date(fx.raspadoEm.getTime() + min * 60000);
+      return FilaParser.lerPagina(doc, { etapa: fx.etapa, raspadoEm: t })
+        .pedidos.map(p => p.expira_em).join('|');
+    });
+    const referencia = r.pedidos.map(p => p.expira_em).join('|');
+    checar(`[${fx.etapa}] prazo estável a ±5 min de erro na hora da raspagem`,
+           variantes.every(v => v === referencia),
+           `${new Set(variantes).size} resultado(s) distinto(s)`);
+
+    // Resumo visual
+    const mistos = r.pedidos.filter(p => p.itens.length > 1).length;
+    const unidades = r.pedidos.reduce((a, p) => a + p.itens.reduce((s, i) => s + i.quantidade, 0), 0);
+    const lojas = [...new Set(r.pedidos.map(p => p.loja))];
+    const plataformas = [...new Set(r.pedidos.map(p => p.plataforma))];
+
+    partes.push(`
+      <h2>${fx.etapa}</h2>
+      <p>
+        colunas detectadas: <code>${(r.colunas || []).join(' · ')}</code><br>
+        paginação: total ${r.paginacao.total_esperado} · página ${r.paginacao.pagina_atual}/${r.paginacao.total_paginas} ·
+        próxima: ${r.paginacao.tem_proxima ? 'sim' : 'não'}<br>
+        pedidos ${r.pedidos.length} · mistos ${mistos} · unidades ${unidades} ·
+        lojas: ${lojas.join(', ')} · plataformas: ${plataformas.join(', ')}
+      </p>
+      <table>
+        <tr><th>nº pedido</th><th>plataforma</th><th>rastreio</th><th>loja</th><th>pago</th><th>expira (texto)</th><th>expira (absoluto)</th><th>itens</th></tr>
+        ${r.pedidos.map(p => `<tr>
+          <td>${p.num_pedido}</td>
+          <td>${p.num_pedido_plataforma || ''}</td>
+          <td>${p.codigo_rastreio || '<span class="aviso">—</span>'}</td>
+          <td>${p.loja || ''} / ${p.plataforma || ''}</td>
+          <td>${p.pago_em ? new Date(p.pago_em).toLocaleString('pt-BR') : ''}</td>
+          <td>${p.expira_em_texto || ''}</td>
+          <td>${p.expira_em ? new Date(p.expira_em).toLocaleString('pt-BR') : ''}</td>
+          <td>${p.itens.map(i => `${i.sku} ×${i.quantidade}`).join('<br>')}</td>
+        </tr>`).join('')}
+      </table>`);
+  }
+
+  const falhas = resultados.filter(r => !r.ok).length;
+  document.getElementById('saida').innerHTML = `
+    <p class="${falhas ? 'fail' : 'ok'}">${falhas ? falhas + ' verificação(ões) falhando' : 'todas as verificações passaram'}
+      — ${resultados.length} no total</p>
+    <ul>${resultados.map(r =>
+      `<li class="${r.ok ? 'ok' : 'fail'}">${r.ok ? '✓' : '✗'} ${r.nome}${r.detalhe ? ' — <em>' + r.detalhe + '</em>' : ''}</li>`
+    ).join('')}</ul>
+    ${partes.join('')}`;
+})();
+</script>
+</body>
+</html>
